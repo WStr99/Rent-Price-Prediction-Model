@@ -1,0 +1,171 @@
+---
+title: "Rent Price Prediction Model"
+author: "Will Strauss"
+subtitle: MGSC-310 Final Project
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+# As long as you are working in a Rstudio Project file, you shouldn't need to 'hard code' directories like this 
+# change to your own working directory
+# knitr::opts_knit$set(root.dir = 'C:/Users/hersh/Dropbox/Chapman/Teaching/MGSC_310/Fall_2019/problem_sets')
+# setwd('C:/Users/hersh/Dropbox/Chapman/Teaching/MGSC_310/Fall_2019/problem_sets')
+
+# set seed to your own favorite number
+set.seed(1818)
+options(width=70)
+options(scipen=99)
+
+
+# general rchunk code options
+
+# this sets text to small
+opts_chunk$set(tidy.opts=list(width.wrap=50),tidy=TRUE, size = "vsmall")  
+opts_chunk$set(message = FALSE,                                          
+               warning = FALSE,
+               # "caching" stores objects in code chunks and only rewrites if you change things
+               cache = TRUE,                               
+               # automatically downloads dependency files
+               autodep = TRUE,
+               # 
+               cache.comments = FALSE,
+               # 
+               collapse = TRUE,
+               fig.width = 5,  
+               fig.height = 4,
+               fig.align='center')
+
+
+```
+
+Cleaning Dataset
+```{r}
+library('tidyverse')
+house <- read.csv(here::here("datasets", "OC_Rent_Address.csv"))
+
+#distribution of price before cleaning
+ggplot(house, aes(price)) + geom_histogram(col = "black", fill = "grey")
+
+house <- house %>% select(-id, - url, -region, - region_url,
+                                       -parking_options, -image_url, -description, -long,
+                                       -lat, -state, -AUTO_UNIQUE_ID_2020.12.07_17tonksmigmailcom_OC_Housing,
+                                       -UpdatedReverseGeocoding, -TimeTaken, -TransactionId, -Source, -ErrorMessage,
+                                       -Version, -ComputedStreetAddress, -ComputedState, -ComputedZipPlus4, 
+                                       -ComputedAPN, -laundry_options)  %>% 
+                                        mutate(type = as.factor(type),
+                                        comes_furnished = as.factor(comes_furnished),
+                                        ComputedCity = as.factor(ComputedCity),
+                                        ComputedZip = as.factor(ComputedZip),
+                                        wheelchair_access = as.factor(wheelchair_access),
+                                        smoking_allowed = as.factor(smoking_allowed),
+                                        dogs_allowed = as.factor(dogs_allowed),
+                                        cats_allowed = as.factor(cats_allowed),
+                                        electric_vehicle_charge = as.factor(electric_vehicle_charge),
+                                        l_price = log(price + 1)) %>%
+                                        filter(l_price > 0) %>% drop_na()
+
+#distribution of price after cleaning
+ggplot(house, aes(l_price)) + geom_histogram(col = "black", fill = "grey")
+glimpse(house)
+```
+
+Splitting the training and testing data
+```{r}
+library('rsample')
+
+houses = initial_split(house, .8)
+
+houses_train = training(houses)
+houses_test = testing(houses)
+```
+
+Building the elastic net model and plotting the min-loss
+```{r}
+library('glmnet')
+library('glmnetUtils')
+library('forcats')
+library('broom')
+
+alpha_list = seq(0,1,.1)
+enet <- cva.glmnet(l_price ~ .-price, data = house, alpha = alpha_list)
+
+minlossplot(enet, cv.type = "min")
+```
+Finding the best alpha value for the elastic net model
+```{r}
+get_alpha <- function(fit) {
+  alpha <- fit$alpha
+  error <- sapply(fit$modlist, 
+                  function(mod) {min(mod$cvm)})
+  alpha[which.min(error)]
+}
+get_model_params <- function(fit) {
+  alpha <- fit$alpha
+  lambdaMin <- sapply(fit$modlist, `[[`, "lambda.min")
+  lambdaSE <- sapply(fit$modlist, `[[`, "lambda.1se")
+  error <- sapply(fit$modlist, function(mod) {min(mod$cvm)})
+  best <- which.min(error)
+  data.frame(alpha = alpha[best], lambdaMin = lambdaMin[best],
+             lambdaSE = lambdaSE[best], eror = error[best])
+}
+
+best_alpha <- get_alpha(enet)
+best_mod <- enet$modlist[[which(enet$alpha == best_alpha)]]
+
+plot(best_mod)
+
+best_alpha <- get_alpha(enet)
+print(best_alpha)
+get_model_params(enet)
+```
+Using toe coefplot library to visualize the coefficients
+```{r}
+library('coefplot')
+ridge = cv.glmnet(l_price ~ .-price, data = houses_train, alpha = best_alpha)
+coefpath(ridge)
+```
+
+getting the model coefficients
+```{r}
+lasso_coefs <- data.frame(
+  `ridge_min` = coef(ridge, s = ridge$lambda.min) %>%
+    as.matrix() %>% data.frame() %>% round(3),
+  `ridge_1se` = coef(ridge, s = ridge$lambda.1se) %>% 
+    as.matrix() %>% data.frame() %>% round(3)
+) %>%  rename(`ridge_min` = 1, `ridge_1se` = 2)
+
+print(lasso_coefs)
+```
+
+Predicting the testing data then plotting predicted values vs true values
+```{r}
+preds_test = as.double(predict(ridge, newdata = na.omit(houses_test), s = ridge$lambda.min))
+preds_train = as.double(predict(ridge, newdata = na.omit(houses_train), s = ridge$lambda.min))
+
+results = data.frame(`true` = houses_test$l_price, 
+                     `pred` = preds_test)
+
+ggplot(results, aes(x = true, y = preds_test)) + 
+  geom_point(color = "black", shape = 1) + 
+  theme_minimal() +
+  geom_smooth(method = "lm", se = FALSE, linetype = "dashed", col = "red") #+ xlim(0, 10000) + ylim(0, 10000)
+```
+Calculating R2
+```{r}
+rss <- sum((preds_train - houses_train$l_price) ^ 2)  ## residual sum of squares
+tss <- sum((houses_train$l_price - mean(houses_train$l_price)) ^ 2)  ## total sum of squares
+ltrain_rsq <- 1 - rss/tss
+
+rss <- sum((preds_test - houses_test$l_price) ^ 2)  ## residual sum of squares
+tss <- sum((houses_test$l_price - mean(houses_test$l_price)) ^ 2)  ## total sum of squares
+ltest_rsq <- 1 - rss/tss
+
+#Training R2
+ltrain_rsq
+#Testing R2:
+ltest_rsq
+```
